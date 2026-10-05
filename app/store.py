@@ -116,6 +116,18 @@ class Store:
                 return RECEIPT_UNAVAILABLE, None
             return RECEIPT_MISSING, None
 
+    def lookup_event_payload(self, digest: str) -> str | None:
+        """按事件摘要取首次接纳时保存的规范化载荷文本；纯只读。
+
+        供恢复端点在摘要文本不直接相等时，按数值语义复核既有回执
+        （旧版本数据卷中的回执摘要未做数字归一化）。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload FROM events WHERE digest = ?", (digest,)
+            ).fetchone()
+            return row[0] if row is not None else None
+
     def nonce_seen(self, station_id: str, nonce: str) -> bool:
         with self._lock:
             row = self._conn.execute(

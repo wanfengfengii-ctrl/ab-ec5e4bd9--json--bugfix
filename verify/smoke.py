@@ -281,6 +281,64 @@ def run_smoke(base_url: str, keys_file: str) -> bool:
         _expect(status == 409 and body["error"]["code"] == "RECEIPT_MISMATCH",
                 f"expected 409 RECEIPT_MISMATCH, got {status}: {body}")
 
+    def _number_payload(dose_repr: str) -> bytes:
+        """dose_usv_h 数字文本可控的载荷（区分 1 / 1.0 / 1.0e2 等写法）。"""
+        event = (
+            '{"station_id":' + json.dumps(active.station_id) +
+            ',"events":[{"event_id":' + json.dumps("evt-" + secrets.token_hex(4)) +
+            ',"measured_at":' + str(int(time.time()) - 5) +
+            ',"dose_usv_h":' + dose_repr + "}]}")
+        return event.encode()
+
+    def case_recover_equivalent_number_repr():
+        """1 接纳、1.0 恢复：数值相等仅文本表示不同，应返回首次回执。"""
+        nonce = _nonce()
+        raw = _number_payload("1")
+        headers = _headers_for(active, int(time.time()), nonce, raw)
+        status, accepted = _post(base_url, raw, headers)
+        _expect(status == 202, f"accept failed: {status}: {accepted}")
+        # 与接纳完全相同的事件，仅把剂量文本 1 换成等值的 1.0
+        rec_raw = raw.replace(b'"dose_usv_h":1}', b'"dose_usv_h":1.0}')
+        rec_headers = _headers_for(active, int(time.time()), nonce, rec_raw,
+                                   path=RECOVER_PATH)
+        status, body = _post(base_url, rec_raw, rec_headers, path=RECOVER_PATH)
+        _expect(status == 200 and body.get("status") == "recovered",
+                f"expected 200 recovered for 1 vs 1.0, got {status}: {body}")
+        _expect(body.get("event_digest") == accepted["event_digest"],
+                "recovered digest should equal the accepted one (1 vs 1.0)")
+        _expect(body.get("received_at") == accepted["received_at"],
+                "recovered received_at should equal the accepted one")
+
+    def case_recover_equivalent_number_repr_reverse():
+        """反向：1.0 接纳、1 恢复同样成立。"""
+        nonce = _nonce()
+        raw = _number_payload("1.0")
+        headers = _headers_for(active, int(time.time()), nonce, raw)
+        status, accepted = _post(base_url, raw, headers)
+        _expect(status == 202, f"accept failed: {status}: {accepted}")
+        rec_raw = raw.replace(b'"dose_usv_h":1.0}', b'"dose_usv_h":1}')
+        rec_headers = _headers_for(active, int(time.time()), nonce, rec_raw,
+                                   path=RECOVER_PATH)
+        status, body = _post(base_url, rec_raw, rec_headers, path=RECOVER_PATH)
+        _expect(status == 200 and body.get("status") == "recovered",
+                f"expected 200 recovered for 1.0 vs 1, got {status}: {body}")
+        _expect(body.get("event_digest") == accepted["event_digest"],
+                "recovered digest should equal the accepted one (1.0 vs 1)")
+
+    def case_recover_changed_number_409():
+        """数值确实变化（1 -> 2）必须仍判 RECEIPT_MISMATCH。"""
+        nonce = _nonce()
+        raw = _number_payload("1")
+        headers = _headers_for(active, int(time.time()), nonce, raw)
+        status, _ = _post(base_url, raw, headers)
+        _expect(status == 202, f"accept failed: {status}")
+        rec_raw = raw.replace(b'"dose_usv_h":1}', b'"dose_usv_h":2}')
+        rec_headers = _headers_for(active, int(time.time()), nonce, rec_raw,
+                                   path=RECOVER_PATH)
+        status, body = _post(base_url, rec_raw, rec_headers, path=RECOVER_PATH)
+        _expect(status == 409 and body["error"]["code"] == "RECEIPT_MISMATCH",
+                f"expected 409 RECEIPT_MISMATCH for 1 vs 2, got {status}: {body}")
+
     def case_recover_signature_must_bind_recover_path():
         raw, _, _ = ctx["json"]
         nonce = _nonce()
@@ -348,6 +406,10 @@ def run_smoke(base_url: str, keys_file: str) -> bool:
         ("recover_gzip_transport_independent", case_recover_gzip_transport_independent),
         ("recover_unknown_nonce_404", case_recover_unknown_nonce_404),
         ("recover_mismatch_409", case_recover_mismatch_409),
+        ("recover_equivalent_number_1_vs_1.0", case_recover_equivalent_number_repr),
+        ("recover_equivalent_number_1.0_vs_1",
+         case_recover_equivalent_number_repr_reverse),
+        ("recover_changed_number_409", case_recover_changed_number_409),
         ("recover_signature_binds_recover_path",
          case_recover_signature_must_bind_recover_path),
         ("recover_does_not_consume_nonce", case_recover_does_not_consume_nonce),

@@ -119,6 +119,38 @@ class DigestTest(unittest.TestCase):
         d2, _ = stable_digest({"a": 2})
         self.assertNotEqual(d1, d2)
 
+    def test_digest_equal_json_numbers_int_and_float(self):
+        """数值相等的 JSON 数字（1 与 1.0）仅文本表示不同，摘要必须一致。"""
+        for a, b in (
+            (1, 1.0), (1.0, 1), (0, 0.0), (100, 1.0e2),
+            (-5, -5.0), (1.5, 1.50), (0.117, 0.1170),
+        ):
+            da, _ = stable_digest({"dose_usv_h": a})
+            db, _ = stable_digest({"dose_usv_h": b})
+            self.assertEqual(da, db, f"{a!r} 与 {b!r} 数值相等却摘要不同")
+
+    def test_digest_distinguishes_different_numbers(self):
+        for a, b in ((1, 2), (1.0, 1.0000001), (0.1, 0.2), (1, -1)):
+            da, _ = stable_digest({"dose_usv_h": a})
+            db, _ = stable_digest({"dose_usv_h": b})
+            self.assertNotEqual(da, db, f"{a!r} 与 {b!r} 数值不同却摘要相同")
+
+    def test_digest_keeps_large_integers_exact(self):
+        """超过 2^53 的大整数不做浮点归并，两个不同整数不得碰撞。"""
+        d1, _ = stable_digest({"x": 9007199254740993})
+        d2, _ = stable_digest({"x": 9007199254740992})
+        self.assertNotEqual(d1, d2)
+        d3, _ = stable_digest({"x": 99999999999999999999998})
+        d4, _ = stable_digest({"x": 99999999999999999999999})
+        self.assertNotEqual(d3, d4)
+
+    def test_digest_bool_not_treated_as_number(self):
+        """布尔值不参与数字归并，保持自身表示。"""
+        d_true, c = stable_digest({"flag": True})
+        d_one, _ = stable_digest({"flag": 1})
+        self.assertNotEqual(d_true, d_one)
+        self.assertIn("true", c)
+
 
 if __name__ == "__main__":
     unittest.main()

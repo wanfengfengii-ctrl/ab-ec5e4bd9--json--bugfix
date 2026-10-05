@@ -142,6 +142,18 @@ class StoreTest(unittest.TestCase):
             reopened.close()
         self.store = Store(self.db)
 
+    def test_lookup_event_payload_by_digest(self):
+        """事件摘要 -> 首次接纳保存的规范化载荷；缺失时返回 None（纯只读）。"""
+        payload = '{"dose_usv_h":1.0}'
+        self.assertTrue(
+            self.store.record_acceptance("st-1", "nonce-1", "k1", "d" * 64, payload, 1.0))
+        self.assertEqual(self.store.lookup_event_payload("d" * 64), payload)
+        self.assertIsNone(self.store.lookup_event_payload("nope"))
+        # 只读：查询不影响回执与防重放
+        state, receipt = self.store.lookup_receipt("st-1", "nonce-1")
+        self.assertEqual(state, RECEIPT_OK)
+        self.assertEqual(receipt.digest, "d" * 64)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,11 +21,17 @@
                  摘要与首次接纳不一致    -> 409 RECEIPT_MISMATCH
     8. 完全一致                          -> 200 + status=recovered + 首次接纳的
                                             event_digest 与 received_at
+
+摘要按数值语义比较：JSON 中数值相等、仅数字文本表示不同的载荷视为同一事件
+（如 dose_usv_h 的 1 与 1.0、100 与 1.0e2）；数字以外内容不同或数值确实
+变化仍判 RECEIPT_MISMATCH。升级前数据卷里保存的旧格式回执也按同一语义
+只读复核（以 events 表中首次接纳保存的载荷为准），不改写任何既有记录。
 """
 from __future__ import annotations
 
 import json
 import logging
+import hmac
 import os
 import re
 import signal
@@ -36,6 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import auth
 from . import payload as payload_mod
+from . import store as store_mod
 from .config import Config
 from .errors import ApiError
 from .keystore import KeyStore
@@ -137,7 +144,7 @@ class Handler(BaseHTTPRequestHandler):
                            "nonce was registered before receipts were kept; "
                            "the original result cannot be recovered")
         assert receipt is not None  # RECEIPT_OK 时必有回执
-        if receipt.digest != req.digest:
+        if not self._receipt_matches(gateway, receipt, req):
             raise ApiError(409, "RECEIPT_MISMATCH",
                            "payload does not match the event accepted "
                            "under this nonce")
@@ -151,6 +158,27 @@ class Handler(BaseHTTPRequestHandler):
             "event_digest": receipt.digest,
             "received_at": int(receipt.received_at),
         }
+
+    def _receipt_matches(self, gateway: Gateway,
+                         receipt: store_mod.Receipt, req: _ValidatedRequest) -> bool:
+        """按数值语义核对恢复载荷与首次接纳回执是否同一事件（纯只读）。
+
+        - 摘要文本一致：直接命中（新接纳的回执均为归一化摘要）。
+        - 文本不一致时，取 events 表中首次接纳保存的规范化载荷，按当前的
+          数字归一化重新计算摘要后比较：这样升级前数据卷里仅因 1/1.0 之类
+          数字写法差异而摘要不同的既有回执也能被恢复，且整个过程不改写
+          任何记录；返回的 event_digest/received_at 仍以原回执为准。
+        """
+        if hmac.compare_digest(receipt.digest, req.digest):
+            return True
+        stored_payload = gateway.store.lookup_event_payload(receipt.digest)
+        if stored_payload is None:
+            return False
+        try:
+            stored_digest, _ = payload_mod.stable_digest(json.loads(stored_payload))
+        except (ValueError, TypeError):
+            return False
+        return hmac.compare_digest(stored_digest, req.digest)
 
     def _validate_request(self, path: str) -> _ValidatedRequest:
         """接纳与恢复共用的校验管线（处理顺序与失败语义完全一致）：

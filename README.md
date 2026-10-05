@@ -106,8 +106,9 @@ HMAC 密钥为该 `X-Key-Id` 对应密钥的 UTF-8 字节。
  "event_digest": "<规范化载荷的 SHA-256 十六进制>", "received_at": 1791163601}
 ```
 
-`event_digest` 为稳定事件摘要：同一事件内容（无论键序、空白、JSON 或 gzip 传输）
-摘要恒定。
+`event_digest` 为稳定事件摘要：同一事件内容（无论键序、空白、JSON 或 gzip 传输，
+以及数值相等的不同数字写法，如 `1` 与 `1.0`、`100` 与 `1.0e2`）摘要恒定；
+数值确实不同（如 `1` 与 `2`）则摘要不同。
 
 ### `POST /api/telemetry/events/recover`
 
@@ -119,6 +120,12 @@ HMAC 密钥为该 `X-Key-Id` 对应密钥的 UTF-8 字节。
 
 网关完成密钥、时间窗、签名与载荷校验后，按（站点、nonce、稳定事件摘要）
 **只读**核对接纳回执——恢复不登记也不改写 nonce：
+
+> 摘要按 **JSON 数值语义** 比较：`1` 与 `1.0`、`100` 与 `1.0e2` 这类仅数字
+> 文本表示不同、数值相等且其余内容一致的载荷视为同一事件；整数与等值浮点
+> 支持双向恢复。数值确实不同（如 `1` → `2`）、字符串等其他字段不同仍判
+> `409 RECEIPT_MISMATCH`。升级前数据卷中的既有回执也按此语义只读复核，
+> 返回的仍是首次接纳保存的 `event_digest` 与 `received_at`，不改写任何记录。
 
 - 完全一致 → `200`：
 
@@ -231,7 +238,8 @@ gzip 发送：将 `body` 替换为 `gzip.compress(body)` 并加头
 ```
 app/            网关实现（server/auth/keystore/store/payload/config/errors）
 keys/keys.json  默认测试密钥
-tests/          单元与端到端测试（72 例，含并发、重启持久化、旧数据卷与回执恢复）
+tests/          单元与端到端测试（84 例，含并发、重启持久化、旧数据卷、等值数字
+                表示的双向回执恢复与回执恢复）
 verify/         一次性验证服务（run.py 汇总退出码，smoke.py 冒烟用例）
 Dockerfile      应用镜像（python:3.12-slim，非 root 运行，构建期语法门禁）
 docker-compose.yml  app（健康检查 + HOST_PORT 可配置）+ verify 一次性服务
