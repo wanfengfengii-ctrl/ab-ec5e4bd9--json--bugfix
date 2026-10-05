@@ -1,0 +1,33 @@
+{
+  "comment": "默认测试密钥，仅用于本地开发与演示；生产环境请通过 KEYS_FILE 挂载正式密钥文件。",
+  "keys": [
+    {
+      "key_id": "test-key-1",
+      "station_id": "station-alpha",
+      "secret": "alpha-test-secret-3f9c1d7e2b48",
+      "not_before": "2026-01-01T00:00:00Z",
+      "not_after": "2027-12-31T23:59:59Z"
+    },
+    {
+      "key_id": "test-key-2",
+      "station_id": "station-beta",
+      "secret": "beta-test-secret-8a6e0c4f5d13",
+      "not_before": "2026-01-01T00:00:00Z",
+      "not_after": "2027-12-31T23:59:59Z"
+    },
+    {
+      "key_id": "test-key-expired",
+      "station_id": "station-alpha",
+      "secret": "expired-test-secret-71bd02c9aa55",
+      "not_before": "2020-01-01T00:00:00Z",
+      "not_after": "2021-01-01T00:00:00Z"
+    },
+    {
+      "key_id": "test-key-future",
+      "station_id": "station-beta",
+      "secret": "future-test-secret-c4049e8172ab",
+      "not_before": "2030-01-01T00:00:00Z",
+      "not_after": "2031-01-01T00:00:00Z"
+    }
+  ]
+}

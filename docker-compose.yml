@@ -1,0 +1,46 @@
+# 遥测网关 Docker Compose 编排
+#
+#   启动网关：            docker compose up --build app
+#   自定义宿主机端口：      HOST_PORT=9090 docker compose up --build app
+#   运行一次性验证服务：   docker compose up --build --exit-code-from verify \
+#                          --abort-on-container-exit verify ; echo $?
+#   清空持久化 nonce 数据： docker compose down -v
+
+services:
+  app:
+    build: .
+    image: telemetry-gateway:latest
+    environment:
+      KEYS_FILE: /app/keys/keys.json
+      DATA_DIR: /data
+      SKEW_SECONDS: "300"
+    volumes:
+      # nonce 防重放登记持久化：服务重启后仍然生效
+      - app-data:/data
+    ports:
+      # 宿主机端口可通过 HOST_PORT 环境变量配置，默认 8080
+      - "${HOST_PORT:-8080}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    image: telemetry-gateway:latest
+    build: .
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      GATEWAY_URL: http://app:8000
+      KEYS_FILE: /app/keys/keys.json
+    # 一次性服务：构建检查 + 单元测试 + 签名/压缩/并发防重放冒烟，退出码汇总结果
+    command: ["python", "-m", "verify.run"]
+    restart: "no"
+
+volumes:
+  app-data:
