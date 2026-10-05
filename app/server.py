@@ -18,7 +18,8 @@
 
     7. 回执核对：nonce 未登记            -> 404 RECEIPT_NOT_FOUND
                  旧数据卷仅有防重放记录  -> 409 RECEIPT_UNAVAILABLE
-                 摘要与首次接纳不一致    -> 409 RECEIPT_MISMATCH
+                 事件内容与首次接纳不一致 -> 409 RECEIPT_MISMATCH
+                 （数值按值比较：JSON 的 1 与 1.0 视为同一事件）
     8. 完全一致                          -> 200 + status=recovered + 首次接纳的
                                             event_digest 与 received_at
 """
@@ -137,7 +138,12 @@ class Handler(BaseHTTPRequestHandler):
                            "nonce was registered before receipts were kept; "
                            "the original result cannot be recovered")
         assert receipt is not None  # RECEIPT_OK 时必有回执
-        if receipt.digest != req.digest:
+        # 先比对稳定摘要；摘要不同时再按事件内容做数值等价核对
+        # （JSON 的 1 与 1.0 解析为 int/float，旧数据卷中的摘要按整数文本
+        # 保存，仅靠摘要串无法识别等值浮点表示）。无论哪种核对成功，返回的
+        # 都是首次接纳时保存的摘要与时刻，绝不生成新结果或改写回执。
+        if receipt.digest != req.digest and not payload_mod.canonical_payloads_equal(
+                receipt.payload, req.canonical_payload):
             raise ApiError(409, "RECEIPT_MISMATCH",
                            "payload does not match the event accepted "
                            "under this nonce")

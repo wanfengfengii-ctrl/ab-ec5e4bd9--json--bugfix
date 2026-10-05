@@ -4,10 +4,13 @@ nonce 以 (station_id, nonce) 为主键，只有在请求通过全部校验、�
 才在同一事务内插入；任何失败路径都不会写入 nonce。数据库文件落在 DATA_DIR
 （Compose 中挂载为命名卷），因此并发请求与服务重启后均满足"至多成功一次"。
 
-receipts 表在接纳的同一事务内记录 (station_id, nonce) -> (digest, received_at)
-回执，供 POST /api/telemetry/events/recover 在不再次接纳的前提下还原原 202
-结果。旧版本数据卷只有 nonces/events 记录而没有 receipts 行，恢复时据此返回
-RECEIPT_UNAVAILABLE，绝不凭空编造接纳结果。
+receipts 表在接纳的同一事务内记录 (station_id, nonce) ->
+(digest, payload, received_at) 回执，供 POST /api/telemetry/events/recover
+在不再次接纳的前提下还原原 202 结果。回执额外保存首次接纳时的规范化载荷，
+使仅存在等值数值表示差异（如 JSON 的 1 与 1.0）的恢复请求也能核对为同一
+事件；此时返回的仍是首次接纳的摘要串本身。旧版本数据卷只有 nonces/events
+记录而没有 receipts 行，恢复时据此返回 RECEIPT_UNAVAILABLE，绝不凭空编造
+接纳结果。
 """
 from __future__ import annotations
 
@@ -33,6 +36,7 @@ CREATE TABLE IF NOT EXISTS receipts (
     station_id  TEXT NOT NULL,
     nonce       TEXT NOT NULL,
     digest      TEXT NOT NULL,
+    payload     TEXT NOT NULL DEFAULT '',
     received_at REAL NOT NULL,
     PRIMARY KEY (station_id, nonce)
 );
@@ -46,9 +50,14 @@ RECEIPT_UNAVAILABLE = "unavailable"  # 仅有旧版防重放记录，无回执�
 
 @dataclass(frozen=True)
 class Receipt:
-    """一次接纳留存的回执：稳定事件摘要与首次接纳时刻（Unix 秒）。"""
+    """一次接纳留存的回执：稳定事件摘要、规范化载荷与首次接纳时刻（Unix 秒）。
+
+    payload 为首次接纳时保存的规范化载荷文本；v1 数据卷中可能为空串，
+    此时恢复核对只能退化为摘要串比对。
+    """
     digest: str
     received_at: float
+    payload: str = ""
 
 
 class Store:
@@ -60,8 +69,26 @@ class Store:
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
         self._lock = threading.Lock()
+
+    def _migrate(self) -> None:
+        """把旧版数据卷升级到当前表结构（幂等）。
+
+        v2 给 receipts 增加 payload 列（首次接纳的规范化载荷）。已存在的
+        回执按 digest 从 events 表回填，使旧数据卷上的数值表示等价恢复
+        同样可用；events 中找不到对应行时回填为空串（退化为摘要比对）。
+        """
+        cols = {row[1] for row in self._conn.execute(
+            "PRAGMA table_info(receipts)")}
+        if "payload" not in cols:
+            self._conn.execute(
+                "ALTER TABLE receipts ADD COLUMN payload TEXT NOT NULL DEFAULT ''")
+            self._conn.execute(
+                "UPDATE receipts SET payload = COALESCE("
+                "    (SELECT e.payload FROM events e WHERE e.digest = receipts.digest),"
+                "    '')")
 
     def record_acceptance(self, station_id: str, nonce: str, key_id: str,
                           digest: str, canonical_payload: str, now: float) -> bool:
@@ -82,9 +109,9 @@ class Store:
                     (digest, station_id, canonical_payload, now),
                 )
                 self._conn.execute(
-                    "INSERT INTO receipts (station_id, nonce, digest, received_at)"
-                    " VALUES (?, ?, ?, ?)",
-                    (station_id, nonce, digest, now),
+                    "INSERT INTO receipts (station_id, nonce, digest, payload, received_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (station_id, nonce, digest, canonical_payload, now),
                 )
                 self._conn.commit()
                 return True
@@ -102,12 +129,13 @@ class Store:
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT digest, received_at FROM receipts"
+                "SELECT digest, received_at, payload FROM receipts"
                 " WHERE station_id = ? AND nonce = ?",
                 (station_id, nonce),
             ).fetchone()
             if row is not None:
-                return RECEIPT_OK, Receipt(digest=row[0], received_at=row[1])
+                return RECEIPT_OK, Receipt(digest=row[0], received_at=row[1],
+                                           payload=row[2])
             seen = self._conn.execute(
                 "SELECT 1 FROM nonces WHERE station_id = ? AND nonce = ?",
                 (station_id, nonce),

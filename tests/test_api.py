@@ -409,6 +409,188 @@ class RecoverTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["event_digest"], accepted["event_digest"])
 
+    # ---------- 数值表示等价的恢复 ----------
+    def _numeric_payload(self, dose, measured=None, event_id="evt-fixed-0001"):
+        return {
+            "station_id": "st-1",
+            "sent_at": int(time.time()),
+            "events": [
+                {"event_id": event_id,
+                 "measured_at": measured if measured is not None else int(time.time()) - 5,
+                 "dose_usv_h": dose, "instrument": "gm-1"},
+            ],
+        }
+
+    def _accept_raw(self, raw: bytes, nonce: str):
+        headers = signed_headers(self.key, int(time.time()), nonce, raw)
+        status, body = post(self.server.url, raw, headers)
+        self.assertEqual(status, 202, f"accept failed: {body}")
+        return body
+
+    def test_recover_integer_then_equal_float(self):
+        """接纳 dose=1（整数文本），恢复 dose=1.0（等值浮点）：200 + 原回执。"""
+        nonce = self._nonce()
+        base = self._numeric_payload(1)
+        raw_int = json.dumps(base).encode()
+        as_float = json.loads(raw_int)
+        as_float["events"][0]["dose_usv_h"] = 1.0
+        raw_float = json.dumps(as_float).encode()
+        # 确认两种写法在传输文本层面确实不同
+        self.assertNotEqual(raw_int, raw_float)
+        accepted = self._accept_raw(raw_int, nonce)
+        status, body = self._recover(raw_float, nonce)
+        self.assertEqual(status, 200, f"body={body}")
+        self.assertEqual(body["status"], "recovered")
+        self.assertEqual(body["event_digest"], accepted["event_digest"])
+        self.assertEqual(body["received_at"], accepted["received_at"])
+        self.assertEqual(body["nonce"], nonce)
+
+    def test_recover_float_then_equal_integer(self):
+        """双向：接纳 dose=1.0，恢复 dose=1 同样成功。"""
+        nonce = self._nonce()
+        base = self._numeric_payload(1.0)
+        raw_float = json.dumps(base).encode()
+        as_int = json.loads(raw_float)
+        as_int["events"][0]["dose_usv_h"] = 1
+        raw_int = json.dumps(as_int).encode()
+        accepted = self._accept_raw(raw_float, nonce)
+        status, body = self._recover(raw_int, nonce)
+        self.assertEqual(status, 200, f"body={body}")
+        self.assertEqual(body["event_digest"], accepted["event_digest"])
+        self.assertEqual(body["received_at"], accepted["received_at"])
+
+    def test_recover_equivalent_number_gzip_transport(self):
+        nonce = self._nonce()
+        base = self._numeric_payload(1)
+        raw_int = json.dumps(base).encode()
+        as_float = json.loads(raw_int)
+        as_float["events"][0]["dose_usv_h"] = 1.0
+        raw_float_gz = gzip.compress(json.dumps(as_float).encode())
+        accepted = self._accept_raw(raw_int, nonce)
+        status, body = self._recover(
+            raw_float_gz, nonce, extra_headers={"Content-Encoding": "gzip"})
+        self.assertEqual(status, 200, f"body={body}")
+        self.assertEqual(body["event_digest"], accepted["event_digest"])
+
+    def test_recover_equivalent_measured_at_representation(self):
+        """measured_at 的整数/等值浮点表示也视为同一事件。"""
+        nonce = self._nonce()
+        measured = int(time.time()) - 10
+        base = self._numeric_payload(1, measured=measured)
+        raw_int = json.dumps(base).encode()
+        as_float = json.loads(raw_int)
+        as_float["events"][0]["measured_at"] = float(measured)
+        as_float["events"][0]["dose_usv_h"] = 1.0
+        raw_float = json.dumps(as_float).encode()
+        accepted = self._accept_raw(raw_int, nonce)
+        status, body = self._recover(raw_float, nonce)
+        self.assertEqual(status, 200, f"body={body}")
+        self.assertEqual(body["event_digest"], accepted["event_digest"])
+
+    def test_recover_changed_number_still_409(self):
+        """数值确实变化（1 -> 2）仍是 409 RECEIPT_MISMATCH。"""
+        nonce = self._nonce()
+        base = self._numeric_payload(1)
+        raw_int = json.dumps(base).encode()
+        changed = json.loads(raw_int)
+        changed["events"][0]["dose_usv_h"] = 2
+        self._accept_raw(raw_int, nonce)
+        status, body = self._recover(json.dumps(changed).encode(), nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "RECEIPT_MISMATCH")
+
+    def test_recover_close_but_unequal_float_still_409(self):
+        nonce = self._nonce()
+        base = self._numeric_payload(1)
+        raw_int = json.dumps(base).encode()
+        changed = json.loads(raw_int)
+        changed["events"][0]["dose_usv_h"] = 1.5
+        self._accept_raw(raw_int, nonce)
+        status, body = self._recover(json.dumps(changed).encode(), nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "RECEIPT_MISMATCH")
+
+    def test_recover_equivalent_number_on_legacy_volume(self):
+        """旧版数据卷（receipts 无 payload 列、摘要按整数文本保存）：
+        重启迁移并从 events 回填载荷后，等值浮点表示仍可恢复，返回原摘要。"""
+        import hashlib
+        import sqlite3
+        nonce = self._nonce()
+        payload = self._numeric_payload(1)
+        # 旧版 stable_digest：无数值归一，1 保持整数文本
+        legacy_canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        legacy_digest = hashlib.sha256(legacy_canonical.encode()).hexdigest()
+        received = 1700000000.25
+        self.server.stop()
+        conn = sqlite3.connect(os.path.join(self.data_dir, "telemetry.db"))
+        conn.execute("DROP TABLE receipts")
+        conn.execute(
+            "CREATE TABLE receipts ("
+            " station_id TEXT NOT NULL, nonce TEXT NOT NULL,"
+            " digest TEXT NOT NULL, received_at REAL NOT NULL,"
+            " PRIMARY KEY (station_id, nonce))")
+        conn.execute(
+            "INSERT INTO nonces (station_id, nonce, key_id, used_at)"
+            " VALUES ('st-1', ?, 'k-active', ?)", (nonce, received))
+        conn.execute(
+            "INSERT INTO events (digest, station_id, payload, received_at)"
+            " VALUES (?, 'st-1', ?, ?)",
+            (legacy_digest, legacy_canonical, received))
+        conn.execute(
+            "INSERT INTO receipts (station_id, nonce, digest, received_at)"
+            " VALUES ('st-1', ?, ?, ?)", (nonce, legacy_digest, received))
+        conn.commit()
+        conn.close()
+        self.server = ServerFixture(self.data_dir, self.keys_file)
+
+        recover_payload = json.loads(legacy_canonical)
+        recover_payload["events"][0]["dose_usv_h"] = 1.0
+        raw_float = json.dumps(recover_payload).encode()
+        status, body = self._recover(raw_float, nonce)
+        self.assertEqual(status, 200, f"body={body}")
+        self.assertEqual(body["status"], "recovered")
+        self.assertEqual(body["event_digest"], legacy_digest)
+        self.assertEqual(body["received_at"], int(received))
+
+    def test_recover_changed_number_on_legacy_volume_still_409(self):
+        """旧数据卷上数值确实变化仍返回 409 RECEIPT_MISMATCH。"""
+        import hashlib
+        import sqlite3
+        nonce = self._nonce()
+        payload = self._numeric_payload(1)
+        legacy_canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        legacy_digest = hashlib.sha256(legacy_canonical.encode()).hexdigest()
+        received = 1700000001.0
+        self.server.stop()
+        conn = sqlite3.connect(os.path.join(self.data_dir, "telemetry.db"))
+        conn.execute("DROP TABLE receipts")
+        conn.execute(
+            "CREATE TABLE receipts ("
+            " station_id TEXT NOT NULL, nonce TEXT NOT NULL,"
+            " digest TEXT NOT NULL, received_at REAL NOT NULL,"
+            " PRIMARY KEY (station_id, nonce))")
+        conn.execute(
+            "INSERT INTO nonces (station_id, nonce, key_id, used_at)"
+            " VALUES ('st-1', ?, 'k-active', ?)", (nonce, received))
+        conn.execute(
+            "INSERT INTO events (digest, station_id, payload, received_at)"
+            " VALUES (?, 'st-1', ?, ?)",
+            (legacy_digest, legacy_canonical, received))
+        conn.execute(
+            "INSERT INTO receipts (station_id, nonce, digest, received_at)"
+            " VALUES ('st-1', ?, ?, ?)", (nonce, legacy_digest, received))
+        conn.commit()
+        conn.close()
+        self.server = ServerFixture(self.data_dir, self.keys_file)
+
+        changed = json.loads(legacy_canonical)
+        changed["events"][0]["dose_usv_h"] = 2
+        status, body = self._recover(json.dumps(changed).encode(), nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "RECEIPT_MISMATCH")
+
     # ---------- 失败路径 ----------
     def test_recover_unknown_nonce_404(self):
         raw = json.dumps(make_payload("st-1")).encode()

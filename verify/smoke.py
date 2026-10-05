@@ -281,6 +281,70 @@ def run_smoke(base_url: str, keys_file: str) -> bool:
         _expect(status == 409 and body["error"]["code"] == "RECEIPT_MISMATCH",
                 f"expected 409 RECEIPT_MISMATCH, got {status}: {body}")
 
+    def case_recover_equivalent_number_int_to_float():
+        """接纳 dose=1（JSON 整数），恢复 dose=1.0（等值浮点文本）：200 + 原回执。"""
+        payload = _payload(active.station_id)
+        payload["events"][0]["dose_usv_h"] = 1
+        raw_int = json.dumps(payload).encode()
+        nonce = _nonce()
+        headers = _headers_for(active, int(time.time()), nonce, raw_int)
+        status, accepted = _post(base_url, raw_int, headers)
+        _expect(status == 202, f"expected 202, got {status}: {accepted}")
+        # 仅数值文本表示不同：1 -> 1.0（业务内容完全一致），重新签名走恢复路径
+        recovered_payload = json.loads(raw_int.decode())
+        recovered_payload["events"][0]["dose_usv_h"] = 1.0
+        raw_float = json.dumps(recovered_payload).encode()
+        _expect(raw_float != raw_int, "test setup: raw bodies should differ")
+        recover_headers = _headers_for(active, int(time.time()), nonce, raw_float,
+                                       path=RECOVER_PATH)
+        status, body = _post(base_url, raw_float, recover_headers, path=RECOVER_PATH)
+        _expect(status == 200, f"expected 200, got {status}: {body}")
+        _expect(body.get("status") == "recovered",
+                f"expected status=recovered, got {body}")
+        _expect(body.get("event_digest") == accepted["event_digest"],
+                "recovered digest must be the original accepted digest")
+        _expect(body.get("received_at") == accepted["received_at"],
+                "recovered received_at must be the original accepted received_at")
+
+    def case_recover_equivalent_number_float_to_int():
+        """双向：接纳 dose=1.0，恢复 dose=1 同样成功。"""
+        payload = _payload(active.station_id)
+        payload["events"][0]["dose_usv_h"] = 1.0
+        raw_float = json.dumps(payload).encode()
+        nonce = _nonce()
+        headers = _headers_for(active, int(time.time()), nonce, raw_float)
+        status, accepted = _post(base_url, raw_float, headers)
+        _expect(status == 202, f"expected 202, got {status}: {accepted}")
+        recovered_payload = json.loads(raw_float.decode())
+        recovered_payload["events"][0]["dose_usv_h"] = 1
+        raw_int = json.dumps(recovered_payload).encode()
+        recover_headers = _headers_for(active, int(time.time()), nonce, raw_int,
+                                       path=RECOVER_PATH)
+        status, body = _post(base_url, raw_int, recover_headers, path=RECOVER_PATH)
+        _expect(status == 200, f"expected 200, got {status}: {body}")
+        _expect(body.get("event_digest") == accepted["event_digest"],
+                "recovered digest must be the original accepted digest")
+        _expect(body.get("received_at") == accepted["received_at"],
+                "recovered received_at must be the original accepted received_at")
+
+    def case_recover_changed_number_still_409():
+        """数值确实变化（1 -> 2）仍必须是 409 RECEIPT_MISMATCH。"""
+        payload = _payload(active.station_id)
+        payload["events"][0]["dose_usv_h"] = 1
+        raw_int = json.dumps(payload).encode()
+        nonce = _nonce()
+        headers = _headers_for(active, int(time.time()), nonce, raw_int)
+        status, _ = _post(base_url, raw_int, headers)
+        _expect(status == 202, f"accept failed: {status}")
+        other = json.loads(raw_int.decode())
+        other["events"][0]["dose_usv_h"] = 2
+        raw_other = json.dumps(other).encode()
+        recover_headers = _headers_for(active, int(time.time()), nonce, raw_other,
+                                       path=RECOVER_PATH)
+        status, body = _post(base_url, raw_other, recover_headers, path=RECOVER_PATH)
+        _expect(status == 409 and body["error"]["code"] == "RECEIPT_MISMATCH",
+                f"expected 409 RECEIPT_MISMATCH, got {status}: {body}")
+
     def case_recover_signature_must_bind_recover_path():
         raw, _, _ = ctx["json"]
         nonce = _nonce()
@@ -346,6 +410,11 @@ def run_smoke(base_url: str, keys_file: str) -> bool:
         ("concurrent_replay_exactly_one_wins", case_concurrent_replay_exactly_one_wins),
         ("recover_happy_200", case_recover_happy),
         ("recover_gzip_transport_independent", case_recover_gzip_transport_independent),
+        ("recover_equivalent_number_int_to_float",
+         case_recover_equivalent_number_int_to_float),
+        ("recover_equivalent_number_float_to_int",
+         case_recover_equivalent_number_float_to_int),
+        ("recover_changed_number_still_409", case_recover_changed_number_still_409),
         ("recover_unknown_nonce_404", case_recover_unknown_nonce_404),
         ("recover_mismatch_409", case_recover_mismatch_409),
         ("recover_signature_binds_recover_path",

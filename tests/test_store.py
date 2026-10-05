@@ -142,6 +142,57 @@ class StoreTest(unittest.TestCase):
             reopened.close()
         self.store = Store(self.db)
 
+    # ---------- v2 迁移：回执载荷列 ----------
+    def test_receipt_stores_canonical_payload(self):
+        canonical = '{"events":[{"dose_usv_h":1.0}]}'
+        self.assertTrue(self.store.record_acceptance(
+            "st-1", "nonce-1", "k1", "d" * 64, canonical, 1.5))
+        _, receipt = self.store.lookup_receipt("st-1", "nonce-1")
+        self.assertEqual(receipt.payload, canonical)
+
+    def test_migration_adds_payload_and_backfills_from_events(self):
+        """v1 数据卷（receipts 无 payload 列）重开后自动加列并从 events 回填。"""
+        self.store.close()
+        import sqlite3
+        conn = sqlite3.connect(self.db)
+        # 构造 v1 表结构：receipts 只有 digest/received_at
+        conn.execute("DROP TABLE receipts")
+        conn.execute(
+            "CREATE TABLE receipts ("
+            " station_id TEXT NOT NULL, nonce TEXT NOT NULL,"
+            " digest TEXT NOT NULL, received_at REAL NOT NULL,"
+            " PRIMARY KEY (station_id, nonce))")
+        conn.execute(
+            "INSERT INTO events (digest, station_id, payload, received_at)"
+            " VALUES (?, 'st-1', ?, 1.5)",
+            ("a" * 64, '{"events":[{"dose_usv_h":1}]}'))
+        conn.execute(
+            "INSERT INTO receipts (station_id, nonce, digest, received_at)"
+            " VALUES ('st-1', 'legacy-1', ?, 1.5)", ("a" * 64,))
+        # events 中找不到对应摘要的回执：回填为空串而非失败
+        conn.execute(
+            "INSERT INTO receipts (station_id, nonce, digest, received_at)"
+            " VALUES ('st-1', 'legacy-2', ?, 2.5)", ("b" * 64,))
+        conn.commit()
+        conn.close()
+
+        migrated = Store(self.db)
+        try:
+            _, r1 = migrated.lookup_receipt("st-1", "legacy-1")
+            self.assertEqual(r1.payload, '{"events":[{"dose_usv_h":1}]}')
+            self.assertEqual(r1.digest, "a" * 64)
+            self.assertEqual(r1.received_at, 1.5)
+            _, r2 = migrated.lookup_receipt("st-1", "legacy-2")
+            self.assertEqual(r2.payload, "")
+            # 迁移后新接纳正常写入 payload
+            self.assertTrue(migrated.record_acceptance(
+                "st-1", "nonce-new", "k1", "c" * 64, '{"x":1}', 3.0))
+            _, r3 = migrated.lookup_receipt("st-1", "nonce-new")
+            self.assertEqual(r3.payload, '{"x":1}')
+        finally:
+            migrated.close()
+        self.store = Store(self.db)
+
 
 if __name__ == "__main__":
     unittest.main()
